@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 DATABASE_URL = "sqlite:///./inventory.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -53,26 +54,35 @@ def get_stock(product_id: str):
 class ReserveRequest(BaseModel):
     product_id: str
     quantity: int
+    order_id: str
 
 @app.post("/inventory/reserve")
 def reserve_stock(req: ReserveRequest):
     db = SessionLocal()
-    product = db.query(Product).filter(Product.id == req.product_id).first()
 
+    product = db.query(Product).filter(Product.id == req.product_id).first()
     if not product:
         db.close()
         raise HTTPException(status_code=404, detail="Product not found")
 
-    if product.stock < req.quantity:
+    result = db.execute(
+        text("UPDATE products SET stock = stock - :qty WHERE id = :pid AND stock >= :qty"),
+        {"qty": req.quantity, "pid": req.product_id},
+    )
+    db.commit()
+
+    if result.rowcount == 0:
         db.close()
         raise HTTPException(status_code=409, detail="Insufficient stock")
 
-    product.stock -= req.quantity
-    db.commit()
-    remaining = product.stock
     db.close()
 
-    return {"status": "reserved", "product_id": req.product_id, "remaining_stock": remaining}
+    return {
+        "status": "reserved",
+        "order_id": req.order_id,
+        "product_id": req.product_id,
+        "quantity": req.quantity,
+    }
 @app.post("/inventory/release")
 def release_stock(req: ReserveRequest):
     db = SessionLocal()
