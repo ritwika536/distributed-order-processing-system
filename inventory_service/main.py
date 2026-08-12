@@ -4,8 +4,8 @@ from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite:///./inventory.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30})
+DATABASE_URL = "postgresql://postgres:devpassword@localhost:5432/inventory"
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 

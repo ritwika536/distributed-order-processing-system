@@ -4,7 +4,10 @@ import threading
 import pika
 from fastapi import FastAPI
 from pydantic import BaseModel
+import datetime
 
+def log(message: str):
+    print(f"[{datetime.datetime.now().isoformat()}] {message}")
 app = FastAPI()
 
 
@@ -36,22 +39,22 @@ def charge(req: ChargeRequest):
 
 
 def on_request(ch, method, properties, body):
-    """This function runs automatically every time a message arrives on the
-    'payment_requests' queue."""
     data = json.loads(body)
-    print(f"[Payment listener] Received charge request: {data}")
+    log(f"[Payment listener] Received charge request: {data}")
 
     result = process_charge(data["order_id"], data["amount"])
+    result["product_id"] = data["product_id"]
+    result["quantity"] = data["quantity"]
 
-    # Send the result back to whichever queue the sender told us to reply to
+    # Publish the result to a fixed queue instead of replying directly --
+    # Order Service's background listener will pick it up whenever it's free.
     ch.basic_publish(
         exchange="",
-        routing_key=properties.reply_to,
-        properties=pika.BasicProperties(correlation_id=properties.correlation_id),
+        routing_key="payment_results",
         body=json.dumps(result),
     )
     ch.basic_ack(delivery_tag=method.delivery_tag)
-    print(f"[Payment listener] Sent result: {result}")
+    log(f"[Payment listener] Published result: {result}")
 
 
 def start_consumer():
@@ -69,12 +72,13 @@ def start_consumer():
             )
             channel = connection.channel()
             channel.queue_declare(queue="payment_requests")
+            channel.queue_declare(queue="payment_results")
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue="payment_requests", on_message_callback=on_request)
-            print("[Payment listener] Waiting for charge requests...")
+            log("[Payment listener] Waiting for charge requests...")
             channel.start_consuming()
         except pika.exceptions.AMQPConnectionError:
-            print("[Payment listener] Connection lost, reconnecting...")
+            log("[Payment listener] Connection lost, reconnecting...")
             continue
 
 
