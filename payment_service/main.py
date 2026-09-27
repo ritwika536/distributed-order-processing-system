@@ -70,8 +70,8 @@ def start_consumer():
         try:
             connection = pika.BlockingConnection(get_connection_params())
             channel = connection.channel()
-            channel.queue_declare(queue="payment_requests")
-            channel.queue_declare(queue="payment_results")
+            channel.queue_declare(queue="payment_requests", durable=True)
+            channel.queue_declare(queue="payment_results", durable=True)
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue="payment_requests", on_message_callback=on_request)
             log("[Payment listener] Waiting for charge requests...")

@@ -33,7 +33,7 @@ def get_channel():
     if not hasattr(_thread_local, "channel") or _thread_local.connection.is_closed:
         _thread_local.connection = pika.BlockingConnection(get_connection_params())
         _thread_local.channel = _thread_local.connection.channel()
-        _thread_local.channel.queue_declare(queue="payment_requests")
+        _thread_local.channel.queue_declare(queue="payment_requests", durable=True)
     return _thread_local.channel
 
 
@@ -115,7 +115,7 @@ def start_result_listener():
         try:
             connection = pika.BlockingConnection(get_connection_params())
             channel = connection.channel()
-            channel.queue_declare(queue="payment_results")
+            channel.queue_declare(queue="payment_results", durable=True)
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue="payment_results", on_message_callback=handle_payment_result)
             log("[Order listener] Waiting for payment results...")
