@@ -1,5 +1,6 @@
 import json
 import time
+import os
 import threading
 import pika
 import requests
@@ -10,28 +11,28 @@ import datetime
 
 def log(message: str):
     print(f"[{datetime.datetime.now().isoformat()}] {message}")
-INVENTORY_URL = "http://localhost:8001"
+
+INVENTORY_URL = os.environ.get("INVENTORY_URL", "http://localhost:8001")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL")
+
+def get_connection_params():
+    if RABBITMQ_URL:
+        return pika.URLParameters(RABBITMQ_URL)
+    return pika.ConnectionParameters("localhost", heartbeat=600)
 
 app = FastAPI()
-redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# Reuse one HTTP connection pool for all calls to Inventory Service,
-# instead of opening a brand new TCP connection on every request.
 http_session = requests.Session()
 
-# --- Per-thread RabbitMQ connection ---
-# pika connections aren't safe to share across threads at the same time,
-# so each thread gets its own connection instead of one global shared one.
 _thread_local = threading.local()
 
 
 def get_channel():
     if not hasattr(_thread_local, "channel") or _thread_local.connection.is_closed:
-        _thread_local.connection = pika.BlockingConnection(
-            pika.ConnectionParameters("localhost", heartbeat=600)
-        )
+        _thread_local.connection = pika.BlockingConnection(get_connection_params())
         _thread_local.channel = _thread_local.connection.channel()
-        # Declare once per connection (per thread), not on every publish
         _thread_local.channel.queue_declare(queue="payment_requests")
     return _thread_local.channel
 
@@ -112,18 +113,16 @@ def handle_payment_result(ch, method, properties, body):
 def start_result_listener():
     while True:
         try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters("localhost", heartbeat=600)
-            )
+            connection = pika.BlockingConnection(get_connection_params())
             channel = connection.channel()
             channel.queue_declare(queue="payment_results")
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue="payment_results", on_message_callback=handle_payment_result)
             log("[Order listener] Waiting for payment results...")
             channel.start_consuming()
-        except pika.exceptions.AMQPConnectionError:
-            log("[Order listener] Connection lost, reconnecting...")
-            continue
+        except Exception as e:
+            log(f"[Order listener] Connection lost, reconnecting in 5s... ({e})")
+            time.sleep(5)
 
 
 @app.on_event("startup")
