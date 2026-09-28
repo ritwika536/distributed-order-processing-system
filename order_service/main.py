@@ -1,32 +1,52 @@
-import json
+import import json
 import time
 import os
 import threading
+import datetime
+
 import pika
 import requests
+import redis
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import redis
-import datetime
+
 
 def log(message: str):
     print(f"[{datetime.datetime.now().isoformat()}] {message}")
 
+
 INVENTORY_URL = os.environ.get("INVENTORY_URL", "http://localhost:8001")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 RABBITMQ_URL = os.environ.get("RABBITMQ_URL")
+
 
 def get_connection_params():
     if RABBITMQ_URL:
         return pika.URLParameters(RABBITMQ_URL)
     return pika.ConnectionParameters("localhost", heartbeat=600)
 
+
 app = FastAPI()
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+# Reuse one HTTP connection pool for calls to Inventory Service
 http_session = requests.Session()
 
+# pika connections aren't thread-safe, so each thread gets its own
 _thread_local = threading.local()
+
+
+def reset_channel():
+    """Drop the cached connection so the next get_channel() reconnects."""
+    conn = getattr(_thread_local, "connection", None)
+    try:
+        if conn and not conn.is_closed:
+            conn.close()
+    except Exception:
+        pass
+    for attr in ("connection", "channel"):
+        if hasattr(_thread_local, attr):
+            delattr(_thread_local, attr)
 
 
 def get_channel():
@@ -49,17 +69,24 @@ def save_order_status(order_id: str, status_data: dict):
 
 
 def publish_payment_request(order_id: str, amount: float, product_id: str, quantity: int):
-    channel = get_channel()
-    channel.basic_publish(
-        exchange="",
-        routing_key="payment_requests",
-        body=json.dumps({
-            "order_id": order_id,
-            "amount": amount,
-            "product_id": product_id,
-            "quantity": quantity,
-        }),
-    )
+    """Publish a charge request. If the cached connection has gone stale
+    (idle timeout, network reset), reconnect and retry once."""
+    body = json.dumps({
+        "order_id": order_id,
+        "amount": amount,
+        "product_id": product_id,
+        "quantity": quantity,
+    })
+    for attempt in (1, 2):
+        try:
+            channel = get_channel()
+            channel.basic_publish(exchange="", routing_key="payment_requests", body=body)
+            return
+        except Exception as e:
+            log(f"[Publish] Attempt {attempt} failed for {order_id}: {e}")
+            reset_channel()
+            if attempt == 2:
+                raise
 
 
 def release_inventory_with_retry(product_id: str, quantity: int, order_id: str, max_attempts: int = 3):
@@ -80,8 +107,10 @@ def release_inventory_with_retry(product_id: str, quantity: int, order_id: str, 
             time.sleep(1)
 
     redis_client.rpush("failed_rollbacks", json.dumps({
-        "order_id": order_id, "product_id": product_id,
-        "quantity": quantity, "reason": "release_failed_after_retries",
+        "order_id": order_id,
+        "product_id": product_id,
+        "quantity": quantity,
+        "reason": "release_failed_after_retries",
     }))
     log(f"[Rollback] FAILED after {max_attempts} attempts for {order_id} -- logged for manual review")
     return False
@@ -151,7 +180,20 @@ def create_order(req: CreateOrderRequest):
         raise HTTPException(status_code=400, detail="Could not reserve inventory")
 
     save_order_status(req.order_id, {"order_id": req.order_id, "status": "PENDING"})
-    publish_payment_request(req.order_id, req.amount, req.product_id, req.quantity)
+
+    try:
+        publish_payment_request(req.order_id, req.amount, req.product_id, req.quantity)
+    except Exception:
+        # Couldn't hand the order to the payment queue: undo the reservation
+        # instead of leaving the order stuck in PENDING forever.
+        release_inventory_with_retry(req.product_id, req.quantity, req.order_id)
+        save_order_status(req.order_id, {
+            "order_id": req.order_id,
+            "status": "FAILED",
+            "reason": "payment_queue_unavailable",
+            "note": "Inventory reservation was rolled back",
+        })
+        raise HTTPException(status_code=503, detail="Payment queue unavailable, please retry")
 
     return {"order_id": req.order_id, "status": "PENDING"}
 
